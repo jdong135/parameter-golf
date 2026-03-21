@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import glob
 import io
 import math
@@ -85,6 +86,13 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Exponential moving average of weights (differs from SWA / checkpoint averaging).
+    # Shadow weights are used for validation when enabled and merged into exported params at the end.
+    ema_decay = float(os.environ.get("EMA_DECAY", "0.999"))
+    use_ema_eval = bool(int(os.environ.get("USE_EMA_EVAL", "1")))
+    # PaLM-style z-loss on log-sum-exp of logits; encourages stable logit scale (often helps CE / BPB).
+    z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", "1e-4"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -276,6 +284,42 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def init_param_ema(module: nn.Module) -> dict[str, Tensor]:
+    return {name: p.detach().float().clone() for name, p in module.named_parameters()}
+
+
+@torch.no_grad()
+def update_param_ema_(module: nn.Module, ema: dict[str, Tensor], decay: float) -> None:
+    one_minus = 1.0 - decay
+    for name, p in module.named_parameters():
+        ema[name].mul_(decay).add_(p.detach().float(), alpha=one_minus)
+
+
+@torch.no_grad()
+def copy_param_ema_to_module_(module: nn.Module, ema: dict[str, Tensor]) -> None:
+    for name, p in module.named_parameters():
+        p.data.copy_(ema[name].to(device=p.device, dtype=p.dtype))
+
+
+@contextmanager
+def eval_with_optional_ema(module: nn.Module, ema: dict[str, Tensor] | None, enabled: bool):
+    if not enabled or ema is None:
+        yield
+        return
+    backup: dict[str, Tensor] = {}
+    with torch.no_grad():
+        for name, p in module.named_parameters():
+            backup[name] = p.data.clone()
+            p.data.copy_(ema[name].to(device=p.device, dtype=p.dtype))
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            for name, p in module.named_parameters():
+                p.data.copy_(backup[name])
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -659,10 +703,12 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        z_loss_weight: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.z_loss_weight = z_loss_weight
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -721,7 +767,12 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        lf = logits.float()
+        ce = F.cross_entropy(lf, targets, reduction="mean")
+        if self.training and self.z_loss_weight > 0.0:
+            z = torch.logsumexp(lf, dim=-1)
+            ce = ce + self.z_loss_weight * (z * z).mean()
+        return ce
 
 
 # -----------------------------
@@ -835,6 +886,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        z_loss_weight=args.z_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +960,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    ema_enabled = 0.0 < args.ema_decay < 1.0
+    log0(
+        f"ema:enabled={ema_enabled} decay:{args.ema_decay} use_ema_eval:{args.use_ema_eval} "
+        f"z_loss_weight:{args.z_loss_weight}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -960,6 +1017,8 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    ema_state: dict[str, Tensor] | None = init_param_ema(base_model) if ema_enabled else None
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -977,18 +1036,19 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            with eval_with_optional_ema(base_model, ema_state, ema_enabled and args.use_ema_eval):
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1032,6 +1092,8 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if ema_state is not None:
+            update_param_ema_(base_model, ema_state, args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1064,6 +1126,10 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    if ema_state is not None:
+        copy_param_ema_to_module_(base_model, ema_state)
+        log0("ema:shadow weights copied into live parameters for export")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
