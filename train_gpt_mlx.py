@@ -67,6 +67,12 @@ class Hyperparameters:
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
+    # Validation evaluation mode (optional). If 0, uses standard non-overlapping chunks.
+    # If 0 < eval_stride < train_seq_len, uses sliding window evaluation scoring only
+    # the last eval_stride tokens in each window (tokenizer-agnostic compression metric).
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))
+    eval_batch_seqs: int = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
@@ -451,6 +457,30 @@ class GPT(nn.Module):
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
 
+    def per_token_loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        """Per-token token-level negative log-likelihood.
+
+        Returns an array of shape (bsz, seqlen) with natural-log NLL for each position.
+        """
+        bsz, seqlen = input_ids.shape
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+
+        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
+            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+            logits = self.softcap(logits_proj)
+            nll = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+            return nll.reshape(bsz, seqlen)
+
+        nll_chunks: list[mx.array] = []
+        n = int(x.shape[0])
+        for s in range(0, n, self.logit_chunk_tokens):
+            e = min(s + self.logit_chunk_tokens, n)
+            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
+            logits = self.softcap(logits_proj)
+            nll_chunks.append(nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="none"))
+        return mx.concatenate(nll_chunks).reshape(bsz, seqlen)
+
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
 # ==============================================================================
@@ -813,6 +843,104 @@ def eval_val(
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
 
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    compiled_per_token_loss,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    """Sliding window validation.
+
+    This fixes the baseline artifact where each non-overlapping chunk's first token has zero context.
+    We generate overlapping windows by `eval_stride`, then only score the last `eval_stride` tokens
+    (or all tokens for the first window / partial last window).
+    """
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    if not (0 < stride < seq_len):
+        raise ValueError(f"eval_stride must satisfy 0 < EVAL_STRIDE < TRAIN_SEQ_LEN, got {stride} with seq_len={seq_len}")
+
+    total_tokens = val_tokens.size - 1
+    if total_tokens <= 0:
+        raise ValueError("Validation token stream is empty")
+
+    # Window starts over x positions: x covers [ws, end), y covers [ws+1, end+1).
+    window_starts = [
+        ws
+        for ws in range(0, total_tokens, stride)
+        if (min(ws + seq_len, total_tokens) - ws) >= 1
+    ]
+    total_windows = len(window_starts)
+    if total_windows <= 0:
+        raise ValueError("No sliding windows created for validation set")
+
+    batch_seqs = max(1, args.eval_batch_seqs)
+    total_batches = max((total_windows + batch_seqs - 1) // batch_seqs, 1)
+
+    loss_sum = 0.0
+    token_count = 0.0
+    total_bytes = 0.0
+
+    # Shape (1, seq_len) for broadcasting.
+    pos_idx = np.arange(seq_len, dtype=np.int32)[None, :]
+
+    for batch_idx, batch_start in enumerate(range(0, total_windows, batch_seqs), start=1):
+        batch_ws = window_starts[batch_start : batch_start + batch_seqs]
+        bsz = len(batch_ws)
+        x_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        y_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        wlen_arr = np.zeros((bsz,), dtype=np.int32)
+        score_start_arr = np.zeros((bsz,), dtype=np.int32)
+
+        for i, ws in enumerate(batch_ws):
+            end = min(ws + seq_len, total_tokens)
+            wlen = end - ws
+            wlen_arr[i] = wlen
+            # First window scores all tokens. Others score the last `stride` tokens.
+            score_start_arr[i] = 0 if ws == 0 else max(wlen - stride, 0)
+            chunk = val_tokens[ws : end + 1]  # length wlen + 1 (x + y)
+            x_np[i, :wlen] = chunk[:-1]
+            y_np[i, :wlen] = chunk[1:]
+
+        x = mx.array(x_np, dtype=mx.int32)
+        y = mx.array(y_np, dtype=mx.int32)
+
+        per_token_nll = compiled_per_token_loss(x, y).astype(mx.float32)  # (bsz, seq_len)
+        mx.eval(per_token_nll)
+
+        # Mask out padded tokens and tokens we choose not to score.
+        wlen_b = wlen_arr[:, None]
+        score_start_b = score_start_arr[:, None]
+        mask = (pos_idx < wlen_b) & (pos_idx >= score_start_b)  # (bsz, seq_len)
+
+        scored_tokens = int(mask.sum())
+        if scored_tokens > 0:
+            mask_mx = mx.array(mask, dtype=per_token_nll.dtype)
+            loss_sum += float((per_token_nll * mask_mx).sum().item())
+            token_count += float(scored_tokens)
+
+            # Tokenizer-agnostic bytes metric.
+            bytes_np = base_bytes_lut[y_np].astype(np.int16, copy=True)
+            bytes_np += (has_leading_space_lut[y_np] & ~is_boundary_token_lut[x_np]).astype(np.int16)
+            total_bytes += float(bytes_np[mask].astype(np.float64).sum())
+
+        if log_fn is not None and total_batches > 1 and (
+            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+        ):
+            log_fn(f"val_progress:{batch_idx}/{total_batches}")
+
+    if token_count <= 0.0 or total_bytes <= 0.0:
+        raise ValueError(f"Invalid sliding eval stats token_count={token_count} total_bytes={total_bytes}")
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss / math.log(2.0)
+    val_bpb = bits_per_token * (token_count / total_bytes)
+    return val_loss, val_bpb
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -875,6 +1003,8 @@ def main() -> None:
         sp, args.vocab_size
     )
 
+    use_sliding_eval = 0 < args.eval_stride < args.train_seq_len
+
     # ==============================================================================
     # TRAINING SETUP
     # ==============================================================================
@@ -914,6 +1044,14 @@ def main() -> None:
         outputs=model.state,
     )
 
+    compiled_per_token_loss = None
+    if use_sliding_eval:
+        compiled_per_token_loss = mx.compile(
+            lambda x, y: model.per_token_loss(x, y),
+            inputs=model.state,
+            outputs=model.state,
+        )
+
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
@@ -950,6 +1088,13 @@ def main() -> None:
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    if use_sliding_eval:
+        log(
+            f"val_eval_mode:sliding_window stride:{args.eval_stride} "
+            f"batch_seqs:{args.eval_batch_seqs} seq_len:{args.train_seq_len}"
+        )
+    else:
+        log("val_eval_mode:standard_non_overlapping")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
@@ -991,6 +1136,9 @@ def main() -> None:
         y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
         warm_val_loss = compiled_loss(x_val, y_val)
         mx.eval(warm_val_loss)
+        if use_sliding_eval and compiled_per_token_loss is not None:
+            warm_val_nll = compiled_per_token_loss(x_val, y_val)
+            mx.eval(warm_val_nll)
         mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
@@ -1005,15 +1153,26 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
-            val_loss, val_bpb = eval_val(
-                args,
-                compiled_loss,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-                log_fn=log,
-            )
+            if use_sliding_eval:
+                val_loss, val_bpb = eval_val_sliding(
+                    args,
+                    compiled_per_token_loss,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                    log_fn=log,
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    compiled_loss,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                    log_fn=log,
+                )
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1086,15 +1245,26 @@ def main() -> None:
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
+    if use_sliding_eval:
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args,
+            compiled_per_token_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")

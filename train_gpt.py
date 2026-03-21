@@ -49,6 +49,12 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    # Validation mode:
+    # - EVAL_STRIDE=0: standard non-overlapping chunk eval
+    # - 0 < EVAL_STRIDE < TRAIN_SEQ_LEN: sliding-window eval that scores
+    #   only the last EVAL_STRIDE tokens per window (except first window)
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -272,6 +278,80 @@ def eval_val(
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    if not (0 < stride < seq_len):
+        raise ValueError(f"eval_stride must satisfy 0 < EVAL_STRIDE < TRAIN_SEQ_LEN, got {stride} with seq_len={seq_len}")
+
+    total_tokens = val_tokens.numel() - 1
+    if total_tokens <= 0:
+        raise ValueError("Validation token stream is empty")
+
+    window_starts = [ws for ws in range(0, total_tokens, stride) if (min(ws + seq_len, total_tokens) - ws) >= 1]
+    total_windows = len(window_starts)
+    if total_windows <= 0:
+        raise ValueError("No sliding windows created for validation set")
+
+    win_start = (total_windows * rank) // world_size
+    win_end = (total_windows * (rank + 1)) // world_size
+    local_window_starts = window_starts[win_start:win_end]
+    batch_seqs = max(1, args.eval_batch_seqs)
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(0, len(local_window_starts), batch_seqs):
+            batch_ws = local_window_starts[batch_start : batch_start + batch_seqs]
+            bsz = len(batch_ws)
+            x = torch.zeros((bsz, seq_len), dtype=torch.int64, device=device)
+            y = torch.zeros((bsz, seq_len), dtype=torch.int64, device=device)
+            mask = torch.zeros((bsz, seq_len), dtype=torch.bool, device=device)
+
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                score_start = 0 if ws == 0 else max(wlen - stride, 0)
+                local = val_tokens[ws : end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+                x[i, :wlen] = local[:-1]
+                y[i, :wlen] = local[1:]
+                mask[i, score_start:wlen] = True
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                per_token_loss = model(x, y, return_per_token=True).detach().to(torch.float32)
+
+            val_loss_sum += per_token_loss[mask].to(torch.float64).sum()
+            val_token_count += float(mask.sum().item())
+
+            token_bytes = base_bytes_lut[y].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[y] & ~is_boundary_token_lut[x]).to(dtype=torch.int16)
+            val_byte_count += token_bytes[mask].to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -710,7 +790,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None, return_per_token: bool = False) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -736,7 +816,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
-        if lora:
+        if lora or return_per_token:
             bsz, sl, V = logits.shape
             return F.cross_entropy(
                 logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
@@ -977,6 +1057,8 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    if args.eval_stride < 0:
+        raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
@@ -1125,6 +1207,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    use_sliding_eval = 0 < args.eval_stride < args.train_seq_len
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1140,6 +1223,13 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if use_sliding_eval:
+        log0(
+            f"val_eval_mode:sliding_window stride:{args.eval_stride} "
+            f"batch_seqs:{args.eval_batch_seqs} seq_len:{args.train_seq_len}"
+        )
+    else:
+        log0("val_eval_mode:standard_non_overlapping")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1209,18 +1299,31 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            if use_sliding_eval:
+                val_loss, val_bpb = eval_val_sliding(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1331,18 +1434,31 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if use_sliding_eval:
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
