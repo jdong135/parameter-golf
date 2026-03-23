@@ -2,6 +2,8 @@
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
 Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+
+Provenance (this fork): Built from the upstream Parameter Golf starter; Muon is credited inline (modded-nanogpt lineage). Training/eval features here (e.g. SwiGLU, hashed bigram skip, EMA, SWA, sliding val, z-loss, zstd export, AdamW on embeddings) are implemented as independent experiments—inspired by public challenge docs and leaderboard write-ups, not pasted from other participants' `records/` submission files. For integrity, treat `records/track_*/*/train_gpt.py` as reference only; do not copy them verbatim into a competitive entry.
 """
 
 from __future__ import annotations
@@ -31,10 +33,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
+# Default competitive-oriented run:
+# - 9 transformer blocks at width 512, optional hashed bigram skip (BIGRAM_BUCKETS×BIGRAM_DIM → model_dim)
 # - 8 attention heads with 4 KV heads (GQA) and SwiGLU FFN (~2/3 the width of relu^2 for similar params)
-# - vocab size 1024, sequence length 1024, tied embeddings
+# - vocab size 1024, sequence length 1024, tied embeddings; int8 export + zstd-22 (or zlib fallback)
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
@@ -50,10 +52,12 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    # Stdout prints are not on the GPU critical path; disabling saves a little SSH/terminal overhead only.
+    log_console = bool(int(os.environ.get("LOG_CONSOLE", "1")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -78,14 +82,14 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     # Decoupled weight decay (AdamW) on embeddings and optional lm_head; block scalars use 0 (gains/scales).
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", "0.04"))
     # Cosine LR multiplier in the final warmdown window (vs linear ramp to 0).
@@ -97,10 +101,20 @@ class Hyperparameters:
     use_ema_eval = bool(int(os.environ.get("USE_EMA_EVAL", "1")))
     # PaLM-style z-loss on log-sum-exp of logits; encourages stable logit scale (often helps CE / BPB).
     z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", "1e-4"))
+    # Sliding-window val: stride < TRAIN_SEQ_LEN scores the last `stride` tokens per window (rich context; see README FAQ).
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "64"))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", "32"))
     # Stochastic Weight Averaging: mean of checkpoints from the last fraction of training (strong val gains).
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.42"))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.4"))
     swa_every = int(os.environ.get("SWA_EVERY", "50"))
+    # Hashed (prev, current) token-pair embedding added to the residual stream before final norm.
+    # Set BIGRAM_BUCKETS=0 to disable. Uses multiplicative mixing (no vocab² table).
+    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", "8192"))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", "64"))
+    bigram_embed_init_std = float(os.environ.get("BIGRAM_EMBED_INIT_STD", "0.02"))
+    # Smaller compressed artifacts → more room under 16MB; falls back to zlib if zstandard is missing.
+    compress_zstd = bool(int(os.environ.get("COMPRESS_ZSTD", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -220,12 +234,16 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, full_stream: bool = False) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if full_stream:
+        if tokens.numel() <= seq_len:
+            raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+        return tokens
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -292,6 +310,70 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Overlap windows by `eval_stride`; score only the last `stride` logits (full left context)."""
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    if not (0 < stride < seq_len):
+        raise ValueError(f"eval_stride must satisfy 0 < EVAL_STRIDE < TRAIN_SEQ_LEN, got {stride} and seq_len={seq_len}")
+    total_len = val_tokens.numel()
+    positions = list(range(0, total_len - seq_len, stride))
+    if not positions:
+        raise ValueError("No sliding windows for validation")
+    rank_positions = positions[rank::world_size]
+    batch_cap = max(1, args.eval_batch_seqs)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    inner = model.module if hasattr(model, "module") else model
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(0, len(rank_positions), batch_cap):
+            batch_pos = rank_positions[batch_start : batch_start + batch_cap]
+            x = torch.stack([val_tokens[p : p + seq_len] for p in batch_pos]).to(device=device, dtype=torch.int64)
+            y = torch.stack([val_tokens[p + 1 : p + seq_len + 1] for p in batch_pos]).to(device=device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = inner.forward_logits(x)
+            score_start = seq_len - stride
+            logits_s = logits[:, score_start:, :].float()
+            targets_s = y[:, score_start:]
+            per_tok = F.cross_entropy(
+                logits_s.reshape(-1, logits_s.size(-1)),
+                targets_s.reshape(-1),
+                reduction="none",
+            )
+            loss_sum += per_tok.to(torch.float64).sum()
+            token_count += float(targets_s.numel())
+            prev_ids = x[:, score_start:].reshape(-1)
+            tgt_ids = targets_s.reshape(-1)
+            tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            byte_count += tb.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    model.train()
+    return val_loss, float(bits_per_token * tokens_per_byte)
 
 
 def init_param_ema(module: nn.Module) -> dict[str, Tensor]:
@@ -480,6 +562,29 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+# Zstd-compressed checkpoints use the standard frame magic (RFC 8878).
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def compress_quant_payload(raw: bytes, use_zstd: bool) -> bytes:
+    if use_zstd:
+        try:
+            import zstandard as zstd
+
+            return zstd.ZstdCompressor(level=22).compress(raw)
+        except Exception:
+            pass
+    return zlib.compress(raw, level=9)
+
+
+def decompress_quant_payload(blob: bytes) -> bytes:
+    if len(blob) >= 4 and blob[:4] == ZSTD_MAGIC:
+        import zstandard as zstd
+
+        return zstd.ZstdDecompressor().decompress(blob)
+    return zlib.decompress(blob)
 
 
 # -----------------------------
@@ -720,11 +825,23 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         z_loss_weight: float = 0.0,
+        bigram_buckets: int = 0,
+        bigram_dim: int = 64,
+        bigram_embed_init_std: float = 0.02,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.z_loss_weight = z_loss_weight
+        self.bigram_buckets = bigram_buckets
+        self.bigram_dim = bigram_dim
+        self.bigram_emb = None
+        self.bigram_proj = None
+        if bigram_buckets > 0:
+            self.bigram_emb = nn.Embedding(bigram_buckets, bigram_dim)
+            self.bigram_proj = CastedLinear(bigram_dim, model_dim, bias=False)
+            self.bigram_proj._zero_init = True
+            nn.init.normal_(self.bigram_emb.weight, mean=0.0, std=bigram_embed_init_std)
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -759,7 +876,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -774,16 +891,25 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        if self.bigram_buckets > 0 and self.bigram_emb is not None and self.bigram_proj is not None:
+            prev = torch.zeros_like(input_ids)
+            prev[:, 1:] = input_ids[:, :-1]
+            h_idx = (prev.long() * 1000003 + input_ids.long()) % self.bigram_buckets
+            x = x + self.bigram_proj(self.bigram_emb(h_idx))
+
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        lf = logits.float()
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
+        lf = logits.float().reshape(-1, logits.size(-1))
+        targets = target_ids.reshape(-1)
         ce = F.cross_entropy(lf, targets, reduction="mean")
         if self.training and self.z_loss_weight > 0.0:
             z = torch.logsumexp(lf, dim=-1)
@@ -839,12 +965,13 @@ def main() -> None:
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
-        print(logfile)
+        if args.log_console:
+            print(logfile)
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
             return
-        if console:
+        if console and args.log_console:
             print(msg)
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
@@ -878,13 +1005,21 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    use_sliding_val = 0 < args.eval_stride < args.train_seq_len
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, full_stream=use_sliding_val)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if use_sliding_val:
+        log0(
+            f"val_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs} "
+            f"seq_len:{args.train_seq_len}"
+        )
+    else:
+        log0(f"val_eval_mode:chunked nonoverlap seq_len:{args.train_seq_len} (set 0<EVAL_STRIDE<SEQ for sliding)")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -903,6 +1038,9 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         z_loss_weight=args.z_loss_weight,
+        bigram_buckets=args.bigram_buckets,
+        bigram_dim=args.bigram_dim,
+        bigram_embed_init_std=args.bigram_embed_init_std,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -922,6 +1060,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if base_model.bigram_proj is not None:
+        matrix_params.append(base_model.bigram_proj.weight)
     scalar_params = [
         p
         for name, p in block_named_params
@@ -930,8 +1070,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params: list[Tensor] = [base_model.tok_emb.weight]
+    if base_model.bigram_emb is not None:
+        tok_params.append(base_model.bigram_emb.weight)
     optimizer_tok = torch.optim.AdamW(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": tok_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.adam_weight_decay,
@@ -990,6 +1133,15 @@ def main() -> None:
     log0(
         f"swa:enabled={args.swa_enabled} start_frac:{args.swa_start_frac} every:{args.swa_every}"
     )
+    if args.bigram_buckets > 0:
+        log0(
+            f"bigram_hash:enabled buckets:{args.bigram_buckets} dim:{args.bigram_dim} "
+            f"(disable with BIGRAM_BUCKETS=0)"
+        )
+    else:
+        log0("bigram_hash:disabled")
+    log0(f"artifact_compress:zstd_preferred:{args.compress_zstd} (zlib fallback if zstandard missing)")
+    log0(f"log_console:{args.log_console} (set LOG_CONSOLE=0 to silence stdout; logs/{args.run_id}.txt unchanged)")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1058,6 +1210,32 @@ def main() -> None:
     swa_count = 0
     swa_started_logged = False
 
+    def run_val() -> tuple[float, float]:
+        if use_sliding_val:
+            return eval_val_sliding(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+        return eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1076,18 +1254,7 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             with eval_with_optional_ema(base_model, ema_state, ema_enabled and args.use_ema_eval):
-                val_loss, val_bpb = eval_val(
-                    args,
-                    model,
-                    rank,
-                    world_size,
-                    device,
-                    grad_accum_steps,
-                    val_tokens,
-                    base_bytes_lut,
-                    has_leading_space_lut,
-                    is_boundary_token_lut,
-                )
+                val_loss, val_bpb = run_val()
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1182,7 +1349,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the compressed int8 artifact (zstd or zlib) and validate the round-tripped weights.
 
     if args.swa_enabled and swa_state is not None and swa_count > 1:
         apply_swa_average_to_module_(base_model, swa_state, swa_count)
@@ -1203,7 +1370,8 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = compress_quant_payload(quant_raw, args.compress_zstd)
+    compress_tag = "zstd22" if len(quant_blob) >= 4 and quant_blob[:4] == ZSTD_MAGIC else "zlib9"
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1212,37 +1380,26 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+{compress_tag}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+{compress_tag}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(decompress_quant_payload(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    q_val_loss, q_val_bpb = run_val()
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
