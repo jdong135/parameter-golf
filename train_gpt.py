@@ -33,7 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # Default Simple Baseline run:
 # - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - 8 attention heads with 4 KV heads (GQA) and SwiGLU FFN (~2/3 the width of relu^2 for similar params)
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -86,6 +86,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Decoupled weight decay (AdamW) on embeddings and optional lm_head; block scalars use 0 (gains/scales).
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", "0.04"))
+    # Cosine LR multiplier in the final warmdown window (vs linear ramp to 0).
+    lr_warmdown_cosine = bool(int(os.environ.get("LR_WARMDOWN_COSINE", "1")))
 
     # Exponential moving average of weights (differs from SWA / checkpoint averaging).
     # Shadow weights are used for validation when enabled and merged into exported params at the end.
@@ -93,6 +97,10 @@ class Hyperparameters:
     use_ema_eval = bool(int(os.environ.get("USE_EMA_EVAL", "1")))
     # PaLM-style z-loss on log-sum-exp of logits; encourages stable logit scale (often helps CE / BPB).
     z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", "1e-4"))
+    # Stochastic Weight Averaging: mean of checkpoints from the last fraction of training (strong val gains).
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.42"))
+    swa_every = int(os.environ.get("SWA_EVERY", "50"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -319,6 +327,14 @@ def eval_with_optional_ema(module: nn.Module, ema: dict[str, Tensor] | None, ena
         with torch.no_grad():
             for name, p in module.named_parameters():
                 p.data.copy_(backup[name])
+
+
+@torch.no_grad()
+def apply_swa_average_to_module_(module: nn.Module, sum_state: dict[str, Tensor], n: int) -> None:
+    inv = 1.0 / float(n)
+    msd = module.state_dict()
+    for k, acc in sum_state.items():
+        msd[k].copy_((acc * inv).to(device=msd[k].device, dtype=msd[k].dtype))
 
 
 # -----------------------------
@@ -648,17 +664,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # SwiGLU FFN (LLaMA-style): 3 matmuls. Hidden set to ~2/3 of relu^2 width so FFN params stay comparable.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        hidden = max(int(round(mlp_mult * dim * 2.0 / 3.0)), 32)
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.up = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
@@ -914,10 +930,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -928,18 +945,20 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=0.0,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
+        optimizer_head = torch.optim.AdamW(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adam_weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -965,6 +984,12 @@ def main() -> None:
         f"ema:enabled={ema_enabled} decay:{args.ema_decay} use_ema_eval:{args.use_ema_eval} "
         f"z_loss_weight:{args.z_loss_weight}"
     )
+    log0(
+        f"mlp:swiglu adam_weight_decay:{args.adam_weight_decay} lr_warmdown_cosine:{args.lr_warmdown_cosine}"
+    )
+    log0(
+        f"swa:enabled={args.swa_enabled} start_frac:{args.swa_start_frac} every:{args.swa_every}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -983,11 +1008,22 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            if not (warmdown_start <= step < args.iterations):
+                return 1.0
+            span = max(args.warmdown_iters - 1, 1)
+            t = (step - warmdown_start) / span
+            if args.lr_warmdown_cosine:
+                return 0.5 * (1.0 + math.cos(math.pi * min(t, 1.0)))
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if remaining_ms > warmdown_ms:
+            return 1.0
+        if args.lr_warmdown_cosine:
+            progress = 1.0 - remaining_ms / max(warmdown_ms, 1e-9)
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return remaining_ms / max(warmdown_ms, 1e-9)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1018,6 +1054,9 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     ema_state: dict[str, Tensor] | None = init_param_ema(base_model) if ema_enabled else None
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+    swa_started_logged = False
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1097,6 +1136,24 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if args.swa_enabled:
+            in_swa_window = False
+            if max_wallclock_ms is not None:
+                in_swa_window = approx_training_time_ms >= max_wallclock_ms * (1.0 - args.swa_start_frac)
+            else:
+                in_swa_window = step >= int(args.iterations * (1.0 - args.swa_start_frac))
+            if in_swa_window and step % max(args.swa_every, 1) == 0:
+                if not swa_started_logged:
+                    log0(f"swa:start step:{step} start_frac:{args.swa_start_frac} every:{args.swa_every}")
+                    swa_started_logged = True
+                cur_sd = base_model.state_dict()
+                if swa_state is None:
+                    swa_state = {k: v.detach().float().cpu().clone() for k, v in cur_sd.items()}
+                    swa_count = 1
+                else:
+                    for k in swa_state:
+                        swa_state[k] = swa_state[k] + cur_sd[k].detach().float().cpu()
+                    swa_count += 1
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1127,7 +1184,10 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    if ema_state is not None:
+    if args.swa_enabled and swa_state is not None and swa_count > 1:
+        apply_swa_average_to_module_(base_model, swa_state, swa_count)
+        log0(f"swa:applied average of {swa_count} checkpoints for export (overrides ema for artifact)")
+    elif ema_state is not None:
         copy_param_ema_to_module_(base_model, ema_state)
         log0("ema:shadow weights copied into live parameters for export")
 
